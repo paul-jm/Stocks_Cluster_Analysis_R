@@ -1,0 +1,255 @@
+---
+title: "R Final Project"
+author: "Paul Jacques-Mignault"
+date: '2018-12-21'
+output: html_document
+runtime: shiny
+---
+
+### Packages Installed
+
+```{r setup, echo=FALSE, message = FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE)
+
+options(repos = c(CRAN='http://cran.reditis.es/'))
+
+if(!'data.table' %in% installed.packages()) {install.packages('data.table')} 
+library(data.table)
+
+if(!'tidyquant' %in% installed.packages()) {install.packages('tidyquant')} 
+library(tidyquant)
+
+if(!"psycho" %in% installed.packages()) {install.packages("psycho")}
+library(psycho)
+
+if(!"tidyverse" %in% installed.packages()) {install.packages("tidyverse")}
+library(tidyverse)
+
+if(!"shiny" %in% installed.packages()) {install.packages("shiny")}
+library(shiny)
+
+if(!"ggplot2" %in% installed.packages()) {install.packages("ggplot2")}
+library(ggplot2)
+
+if(!"usdm" %in% installed.packages()) {install.packages("usdm")}
+library(usdm)
+
+if(!"readxl" %in% installed.packages()) {install.packages("readxl")}
+library(readxl)
+
+```
+
+### Custom Functions
+
+```{r functions, echo=TRUE, message = FALSE,}
+
+make_interactive <- function(plot_name, df) {
+  
+ui <- basicPage( 
+  plotOutput("plot1", click = "plot_click"), # For a click on a particular plot
+  verbatimTextOutput("info") # Produce a text output
+)
+
+server <- function(input, output) { # Create a function with 2 arguments
+  output$plot1 <- renderPlot({ plot_name }) # The function will work for any particular ggplot
+
+  output$info <- renderPrint({
+    nearPoints(df, input$plot_click, # For any data frame associated with the plot
+               threshold = 10, maxpoints = 1, # 10 is the distance threshold (pixels) between the click and the dot, only one point's information can be displayed at one
+               addDist = FALSE) # Don't display information on the distance
+  })
+}
+shinyApp(ui, server) #Return shiny output, which is the interactive graph
+}
+
+make_numeric <- function(df) { # Function taking any data frame as output
+  df[ , sapply(df,is.numeric)] # Only picks out numeric columns in the data frame
+}
+
+```
+
+## Data Preparation
+
+The package used for the present analysis is 'tidyverse'. Quandmod functions were unable to obtain stock price data for 'QRTEA' stock, because the stock was not traded in the period of interest. The 'tq_get' function selects only compete cases from the imported stocks. It also typically operates faster than 'quandmod', and there is no need to melt to obtain all stocks rows instead of columns.
+
+The scope of the analysis will include the three calendar years of 2015, 2016, and 2017, and  will focus on daily closing prices.
+
+```{r preparation, echo=TRUE}
+
+#setwd('/Users/paul.jacques-mignault/Desktop/R_Final') #ONLY FOR PAUL'S COMPUTER!!!
+
+stock_symbols <- as.data.frame(read_excel ('nasdaq_symbols.xlsx')) # Import the xlsxfile
+
+stock_list <- as.vector(stock_symbols[['Symbol']]) # Isolate the symbols' column as a vector
+
+start <- as.Date('2015-01-01') #The start date
+end <- as.Date('2017-12-31') # The last date of the analysis
+
+stock_prices  <- as.data.frame(tq_get(stock_list, get = 'stock.prices', # Get all stock prices for the symbols
+                                      from = start, to = end )) # With pre-defined timeframe
+
+#The tq_get function already selects complete cases, but just to make sure...
+stock_prices <- stock_prices[complete.cases(stock_prices),
+                             c('symbol', 'date', 'close')] # Select relevant columns
+
+for (i in 1:nrow(stock_prices)) { # Establish the for loop, for all rows in the df
+  if (identical(stock_prices[i,'symbol'], stock_prices[(i-1),'symbol']) == TRUE) { # If stock from the row before is the same as the relevant row
+    stock_prices[i,'return'] <- (((stock_prices[i, 'close'] # Create a new  column called 'return'
+     - stock_prices[(i-1), 'close']) # Today's value - yesterday's value
+     / stock_prices[(i-1), 'close'])*100) # Divided by yesterday's value, *100 to speak in percentage terms.  
+  } else { stock_prices[i,'return'] <- NA } # NA if two consecutive rows not for the same stock
+} 
+
+stock_prices_agg <- merge(aggregate(. ~ symbol, stock_prices[ , c('symbol', 'return')], # Aggregate for mean of return for all symbos
+                              function(x) mean = mean(x)),
+                          aggregate(. ~ symbol, stock_prices[ , c('symbol', 'return')], # Aggregate for sd of return for all symbols
+                              function(x) sd = sd(x)),
+                          by = 'symbol', all = TRUE, suffix = c("_mean", "_sd")) # Make it an outer join
+
+stock_prices_agg <- merge(stock_prices_agg, stock_symbols, # Add company names to the aggregate df
+                          by.x = 'symbol', by.y = 'Symbol', all.x = TRUE) # Make it a left join
+
+stock_prices_agg <- stock_prices_agg[ ,
+                    c('symbol', 'Name', 'return_mean', 'return_sd')] # Pick out only relevant columns
+
+head(stock_prices_agg) # Check it out
+
+```
+
+## Regression Analysis
+
+1/ A preliminary analysis would include checking for variation inflation factor (VIF), which examines collinerity between variables. Typically, a VIF score higher than 5 would imply variables are correlated within one another. As the VIF score between profitability (Mean return) and volatility (Standard deviation of return) is of 1.02, the two variables are highly unlikely to be correlated with one another.
+
+2/ Further to checking the VIF, this analysis also includes a linear regression model, which output is provided. The independent variable is assumed to be the volatility, and the dependent variable is assumed to be profitability, as the latter is the primary concern for most investors. The adjusted-R2 of the regression is 0.01, implying very weak correlation, consistently with the VIF output. Furthermore, p-values for both the coefficient and the intercept are both above 0.05, implying they are not statistically significant.  
+
+In order to research if a better model can be generated, a polynomical term of order 2 for the independent variable is introduced, with little to no improvement in the regression results. 
+
+3/ In the present section, the residuals are also graphed into a histogram. This allows to ensure they are normally distributed. Otherwise, there may be another underlying trend in the data the above regression failed to capture. As displayed in the histogram, residuals follow a fairly normal distribution. 
+
+```{r regression, echo=TRUE}
+#Check for collinearity between the numeric variables in the data frame
+collinearity_check <- make_numeric(stock_prices_agg) # Pick out only numeric columns
+output <- vif(collinearity_check) # Check for collinearity to start
+
+output
+
+linear_regression <- lm(return_mean~., # Linear regression for y=mean, with x= all other columns, in this case only sd(return)
+                        data = make_numeric(stock_prices_agg)) # Pick out only numeric columns
+
+print(summary(linear_regression)) # View results
+
+linear_regression_2 <- lm(return_mean~.+I(return_sd^2), # Try again with a polynomical term of order 2
+                          data = make_numeric(stock_prices_agg)) # Pick out only numeric columns
+
+print(summary(linear_regression_2)) # View results
+
+hist(resid(linear_regression), # Select only residuals
+      main = 'Residual Histogram', # Input Title
+      xlab = 'Residual Values')  # Change label of x-axis
+
+```
+
+## Visualization of Regression Analysis
+
+In the graph displayed, the user can clearly realize how spread out the stocks are from the line. As previously demonstrated in the regression analysis, the relationship between the two variables is nearly non-existent. This is confirmed by the scatterplot, since the line displayed is nearly flat.
+
+The user can click on any dot to print the stock symbol, company name, daily return in %, and the return standard deviation in %.
+
+```{r regression visualization, echo=TRUE}
+
+regressionplot <- ggplot(stock_prices_agg, aes(return_sd, return_mean)) + # Select data, x, and y input for the scatterplot
+                    geom_point() + # Display all point
+                    stat_smooth(method='lm') + # Have trend line that follows the linear regression model
+                    ggtitle('Regression Analysis between Volatility and Profitability of Stocks') + # Add title
+                    labs(x = 'Standard Deviation of Daily Return (%)', # Rename x-axis
+                    y = 'Average Daily Return (%)') # Rename y-axis
+
+make_interactive(regressionplot, stock_prices_agg) # Use shiny custom function
+
+```
+
+## Clustering Analysis
+
+1/ Prior to starting the clustering analysis, the data numerical stocks data needs to be standardized. This can avoid attributing disproportionate importance to a variable measured on a scale different than that of others. 
+
+2/ With a k-means clustering analysis, the user can select the desired number of clusters. In order to determine the optimal number of clusters, all possible number of clusters between 2 and 10 are graphed against the sum of squares within clusters. The sum of squares within clusters is a measure of cohesion. As the inflection point takes place for k=4, the user can understand 4 is the optimal number of clusters to minimize complexity and ensure clusters make sense. The silhouette (ratio comparing cohesion to separation) for k=4 is 72.7%, which indicates a strong clustering structure. Intuitively, this number of cluster makes sense since the data frame includes 2 variables which can be above or below the mean; 2 variables * 2 possibilities = 4 possible clusters.
+
+3/ After standardizing the variables and generating 4 clusters for the stocks, the following are cluster labels, inspired from the 'BCG Product Matrix':
+
+  - High Return and Low Volatility: 'Stars'. Those stocks are the stars, since they are more profitable than average and feature lower than average volatility. They should be recommended as 'Buy' for all investors, since they outperform the market.  
+  
+  - High Return and High Volatility: 'Question Marks'. Those stocks are highly profitable, though have shown high volatility in the last 3 years. They should be only for investors with little aversion to risk. 
+  
+  - Low Return and Low Volatility: 'Cash Cows'. Such stocks have shown to be stable over time, though with lower than average return. This implies the companies may be operating in more mature industries with few growth perspectives. They should be advised for risk-averse investors,  who will tolerate a lower return for more stability. 
+  
+  - Low Return and Low Volatility: 'Dogs'. Such stocks underperform the market for profitability, though present higher volatility than others. They should be avoided by most investors. 
+
+```{r cluster, echo=TRUE}
+
+# Values in sd column generally higher than mean; let's standardize!!!
+stock_prices_agg_z <- stock_prices_agg %>% # Only for the sake of clustering will we create  _z df
+  psycho::standardize() # Perform standardization
+
+set.seed(15) # For reproducibility
+# Compute and plot wss for k = 2 to k = 15.
+k.max <- 10 # Analyze within sum of squares for up to 10 clusters
+within_sum_squares <- sapply(2:k.max, # For all possible number of clusters between 2 and 10
+              function(k) {kmeans (make_numeric(stock_prices_agg_z), # Apply kmeans to the numeric df 
+                                   k, nstart=50,iter.max = 15 )$tot.withinss}) # for function here labeled 'k'
+
+within_sum_squares # View results
+
+plot(2:k.max, within_sum_squares, # Plot the results to visualize the curve
+     type="b", pch = 15, frame = FALSE, # Graphical details; types of dots, type of line, etc.
+     xlab="Number of clusters K", # Rename x-axis
+     ylab="Total within-clusters sum of squares") # Rename y-axis
+     abline(v = 4, lty =2) # Add vertical line at desired point
+
+k <- 4 # Use 4 clusters, recognized as the optimal
+stock_cluster <- kmeans(make_numeric(stock_prices_agg_z), # kmeans function applied to numeric df
+                        k, nstart = 15)
+
+stock_cluster # View results
+
+stock_prices_agg$cluster <- (stock_cluster$cluster) # Integrate as column of the original data table
+
+for (i in 1:nrow(stock_prices_agg)) { # for every row in the aggregate df
+  if (stock_prices_agg[i, 'cluster'] == 1) { # If defined as belonging to cluster 1
+    stock_prices_agg[i, 'cluster'] <- 'Stars' # Call it Stars
+  } else if (stock_prices_agg[i, 'cluster'] == 2) { # If defined as belonging to cluster 2
+    stock_prices_agg[i, 'cluster'] <- 'Dogs' # Call it Dogs
+  } else if (stock_prices_agg[i, 'cluster'] == 3) { # If defined as belonging to cluster 3
+    stock_prices_agg[i, 'cluster'] <- 'Cash Cows' # Call it Cash Cows
+  } else if (stock_prices_agg[i, 'cluster'] == 4) { # If defined as belonging to cluster 4
+    stock_prices_agg[i, 'cluster'] <- 'Question Marks' # Call it Question Marks
+  }
+}
+
+```
+
+## Visualization of Clustering Analysis
+
+Interactive data visualization of stock clusters. The user can click on any dot to print the stock symbol, company name, daily return in %, return standard deviation in %, as well as the corresponding cluster name. 
+
+```{r visualization, echo=TRUE}
+
+clusterplot <- ggplot(stock_prices_agg, # Pick out the relevant df
+                      aes(return_sd, return_mean, color = cluster)) + # Define x, y, and color data
+                      geom_point() + # Have points for all stocks
+                      ggtitle('Cluster Analysis of Stocks') + # Add title
+                      stat_ellipse(aes(x = return_sd, y = return_mean, fill=factor(cluster)), # Have shapes to approximately cover clusters
+                      geom="polygon", level=0.85, alpha=0.2) + # Make the shape a polygon, to cover 80% of cluster points
+                      labs(x = 'Standard Deviation of Daily Return (%)', # Rename x-axis
+                           y = 'Average Daily Return (%)') + # Rename y-axis
+                      guides(color=guide_legend('Cluster'),fill=guide_legend('Cluster')) # Add legend for clusters
+
+make_interactive(clusterplot, stock_prices_agg) # Use custom function for interactions
+
+```
+
+## Conclusion
+
+In conclusion, several factors may influence stock profitability, though the present analysis determined  volatility was not one of them. Furthermore, the present also provided a clustering analysis in an attempt to  guide investors in their decisions. Stocks belonging to the 'Star' cluster should be priviledged, as well  as 'Question Marks' and 'Cash Cows' depending  on risk-aversion. Stocks belonging to cluster 'Dogs' should be avoided.
